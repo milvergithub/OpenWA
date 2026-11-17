@@ -7,6 +7,8 @@ import {
   MARK_READ_MESSAGE_ID_MESSAGE,
   MARK_READ_MESSAGE_ID_PATTERN,
 } from '../../../modules/session/dto/mark-chat-read.dto';
+import { chatIdSchema, chatJidSchema } from '../chat-id-schema';
+import { listLimitSchema } from '../list-limit-schema';
 import { defineTool, type AnyToolDescriptor } from '../tool-descriptor';
 import { paginate } from '../../../common/utils/paginate';
 
@@ -20,7 +22,7 @@ export function sessionTools(session: SessionService): AnyToolDescriptor[] {
         'List the WhatsApp sessions this API key may access (id, name, status). Use to discover available sessions before calling session-scoped tools. Supports limit/offset paging and an exact, case-sensitive name filter.',
       tier: 'read',
       inputSchema: z.object({
-        limit: z.number().int().min(1).max(1000).optional(),
+        limit: listLimitSchema,
         offset: z.number().int().min(0).optional(),
         name: z.string().min(1).describe('Exact session name (case-sensitive)').optional(),
       }),
@@ -47,14 +49,18 @@ export function sessionTools(session: SessionService): AnyToolDescriptor[] {
       sessionScoped: true,
       inputSchema: z.object({
         sessionId,
-        limit: z.number().int().min(1).max(1000).optional(),
+        limit: listLimitSchema,
         offset: z.number().int().min(0).optional(),
       }),
       handler: async (input, apiKey, chatScope) => {
         if (!chatScope?.isRestricted(apiKey)) {
           return session.getChats(input.sessionId, { limit: input.limit, offset: input.offset });
         }
-        const visible = await chatScope.filter(apiKey, await session.listChats(input.sessionId), chat => chat.id);
+        const visible = await chatScope.filter(
+          apiKey,
+          await session.listChats(input.sessionId, input.offset),
+          chat => chat.id,
+        );
         return paginate(visible, input.limit, input.offset);
       },
     }),
@@ -78,7 +84,7 @@ export function sessionTools(session: SessionService): AnyToolDescriptor[] {
       sessionScoped: true,
       inputSchema: z.object({
         sessionId,
-        chatId: z.string().min(1).describe('Chat JID (e.g. 1234567890@c.us)'),
+        chatId: chatJidSchema.describe('Chat JID (e.g. 1234567890@c.us)'),
       }),
       handler: input => session.subscribeToPresence(input.sessionId, input.chatId).then(() => ({ success: true })),
     }),
@@ -86,16 +92,21 @@ export function sessionTools(session: SessionService): AnyToolDescriptor[] {
       name: 'SessionGetPresence',
       chatScope: ['chatId'],
       description:
-        'The last presence reported for a chat, or null when none has been — the chat was never ' +
-        'subscribed, or nothing has changed since. Subscribe first with SessionSubscribePresence.',
+        'The last presence reported for a chat, or null when none has been: the chat was never ' +
+        'subscribed, or nothing has changed since. observedAt is when the gateway received the report, as an ' +
+        'ISO date-time. Subscribe first with SessionSubscribePresence.',
       tier: 'read',
       requiredRole: ApiKeyRole.VIEWER,
       sessionScoped: true,
       inputSchema: z.object({
         sessionId,
-        chatId: z.string().min(1).describe('Chat JID (e.g. 1234567890@c.us)'),
+        chatId: chatIdSchema.describe('Chat JID (e.g. 1234567890@c.us)'),
       }),
-      handler: input => session.getPresence(input.sessionId, input.chatId),
+      handler: async input => {
+        const presence = await session.getPresence(input.sessionId, input.chatId);
+        // The store keeps unix milliseconds; REST answers a date-time (ChatPresenceResponseDto), so both do.
+        return presence ? { ...presence, observedAt: new Date(presence.observedAt) } : null;
+      },
     }),
     defineTool({
       name: 'SessionMarkChatRead',
@@ -106,7 +117,7 @@ export function sessionTools(session: SessionService): AnyToolDescriptor[] {
       sessionScoped: true,
       inputSchema: z.object({
         sessionId,
-        chatId: z.string().min(1).describe('Chat JID (e.g. 1234567890@c.us)'),
+        chatId: chatJidSchema.describe('Chat JID (e.g. 1234567890@c.us)'),
         messageIds: z
           // The element rule comes from the DTO rather than being restated here: the REST body
           // rejects a whitespace-only id, and this path reaches the engine without the DTO at all.
@@ -116,7 +127,8 @@ export function sessionTools(session: SessionService): AnyToolDescriptor[] {
           .optional()
           .describe(
             'Specific message IDs to acknowledge. Baileys acknowledges individual messages, so without ' +
-              'this only the newest received message still held in memory gets a receipt.',
+              'this only the newest received message gets a receipt: the one held in memory, else the ' +
+              'newest received one the gateway stored.',
           ),
       }),
       handler: input =>
@@ -131,7 +143,7 @@ export function sessionTools(session: SessionService): AnyToolDescriptor[] {
       sessionScoped: true,
       inputSchema: z.object({
         sessionId,
-        chatId: z.string().min(1).describe('Chat JID (e.g. 1234567890@c.us)'),
+        chatId: chatJidSchema.describe('Chat JID (e.g. 1234567890@c.us)'),
       }),
       handler: input => session.markUnread(input.sessionId, input.chatId).then(success => ({ success })),
     }),
@@ -144,7 +156,7 @@ export function sessionTools(session: SessionService): AnyToolDescriptor[] {
       sessionScoped: true,
       inputSchema: z.object({
         sessionId,
-        chatId: z.string().min(1).describe('Chat JID (e.g. 1234567890@c.us)'),
+        chatId: chatJidSchema.describe('Chat JID (e.g. 1234567890@c.us)'),
         state: z
           .enum(['typing', 'recording', 'paused'])
           .describe("'typing' or 'recording' shows the indicator; 'paused' clears it"),

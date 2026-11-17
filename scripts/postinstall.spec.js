@@ -30,13 +30,15 @@ const EXPECTED_PATCHER_ORDER = [
   'patch-wwebjs-status.js',
   'patch-wwebjs-ready-sync.js',
   'patch-wwebjs-participant-arity.js',
-  'patch-wwebjs-block.js',
   'patch-wwebjs-group-description.js',
   'patch-wwebjs-media-id.js',
   'patch-wwebjs-send-error.js',
   'patch-baileys-appstate.js',
   'patch-baileys-newsletter-create.js',
   'patch-baileys-pairing.js',
+  'patch-baileys-media-stream.js',
+  'patch-baileys-status-ack.js',
+  'patch-wwebjs-puppeteer.js',
 ];
 
 /** Bare temp dir optionally holding a dashboard/ and/or the patch scripts. */
@@ -167,8 +169,7 @@ test('planSteps: participant-arity patcher plans its own best-effort repair', ()
 test('planSteps: dashboard and all patchers run in stable order', () => {
   // The fixture is derived rather than hand-listed. A hand-listed one never creates the file for a
   // patcher added later, so planSteps never plans it, the count assertion stays green, and the test
-  // quietly stops covering what it is named for. The block and group-description patchers both
-  // reached that state.
+  // quietly stops covering what it is named for. The group-description patcher reached that state.
   assert.deepEqual(
     [...EXPECTED_PATCHER_ORDER].sort(),
     PATCHERS_ON_DISK,
@@ -185,7 +186,10 @@ test('planSteps: dashboard and all patchers run in stable order', () => {
   );
   for (const step of steps.slice(1)) {
     assert.equal(step.command, process.execPath);
-    assert.deepEqual(step.args.slice(1), ['--best-effort']);
+    assert.deepEqual(
+      step.args.slice(1),
+      path.basename(step.args[0]) === 'patch-wwebjs-puppeteer.js' ? [] : ['--best-effort'],
+    );
   }
 });
 

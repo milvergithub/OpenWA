@@ -1,12 +1,15 @@
 import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
+import type { Readable } from 'stream';
 import { EngineRegistry } from '../../engine/engine-registry.service';
 import { StatusStoreService } from '../status-store/status-store.service';
 import { StorageService, isMissingObjectError } from '../../common/storage/storage.service';
 import type { Status, StatusResult, StatusPostOptions } from '../../engine/interfaces/whatsapp-engine.interface';
-import { assertBase64WithinMediaCap, stripBase64DataUri } from '../message/media-cap.util';
+import { assertBase64WithinMediaCap, resolveMediaBody, stripBase64DataUri } from '../message/media-cap.util';
 import { HookManager, applySendingGate } from '../../core/hooks';
 import { SendPacingService, countsTowardSendBreaker } from '../message/send-pacing.service';
+import { clientFacingSsrfError } from '../../common/media/client-facing-ssrf-error';
 import { isMediaUrl } from '../../common/media/media-url';
+import { createLogger } from '../../common/services/logger.service';
 
 /** Stored status media is only ever an image, a video or a voice note; a sender-declared mimetype
  * outside that is served as inert octet-stream so the media endpoint can't be turned into active
@@ -27,6 +30,7 @@ const BASE64_TEXT = /^[A-Za-z0-9+/_\-\s]*(?:=+\s*)?$/;
 
 @Injectable()
 export class StatusService {
+  private readonly logger = createLogger('StatusService');
   // HookManager comes from the @Global() HooksModule, StorageService from the @Global()
   // StorageModule — neither needs a module import here.
   constructor(
@@ -87,19 +91,24 @@ export class StatusService {
     return this.store.listByContact(sessionId, contactId);
   }
 
-  async getStatusMedia(sessionId: string, statusId: string): Promise<{ buffer: Buffer; mimetype: string }> {
+  /** Opens the stored file as a stream, so a large video is never held in memory whole. */
+  async getStatusMedia(
+    sessionId: string,
+    statusId: string,
+  ): Promise<{ stream: Readable; size?: number; mimetype: string }> {
     const media = await this.store.getMedia(sessionId, statusId);
     if (!media) {
       throw new NotFoundException('Status media not found or expired');
     }
     try {
-      const buffer = await this.storageService.getFile(media.path);
+      // A missing or unreadable file rejects here, before anything is answered.
+      const { stream, size } = await this.storageService.openFile(media.path);
       // MIME types are case-insensitive, and a browser treats `image/SVG+XML` exactly as it treats
       // `image/svg+xml`: the check runs on the normalized essence, and that is what gets served.
       const essence = media.mimetype.split(';')[0].trim().toLowerCase();
       const mimetype =
         SAFE_STATUS_MIMETYPE.test(essence) && essence !== 'image/svg+xml' ? essence : 'application/octet-stream';
-      return { buffer, mimetype };
+      return { stream, size, mimetype };
     } catch (error) {
       // The row outlived its file: purgeExpired (or a concurrent delete) removed it between the
       // DB read and this read. That's "gone", not a server fault — surface a 404. The helper covers
@@ -118,8 +127,13 @@ export class StatusService {
    * wrapper, so a policy refusal never feeds the breaker — and neither do the client-fault checks
    * the adapters run inside the call (Baileys refuses a status with no recipients, a media URL can
    * be SSRF-blocked): those say nothing about the account's standing. See countsTowardSendBreaker.
+   * A media URL the SSRF guard refused leaves as the caller's 400, not as the guard's own error.
    */
-  private async recordedPost(sessionId: string, post: () => Promise<StatusResult>): Promise<StatusResult> {
+  private async recordedPost(
+    sessionId: string,
+    kind: string,
+    post: () => Promise<StatusResult>,
+  ): Promise<StatusResult> {
     try {
       const result = await post();
       this.pacing.recordSendSuccess(sessionId);
@@ -127,8 +141,15 @@ export class StatusService {
     } catch (error) {
       if (countsTowardSendBreaker(error)) {
         this.pacing.recordSendFailure(sessionId);
+        // The same classification picks the failures worth a log line. Otherwise an engine-side failure
+        // leaves only Nest's generic `[ExceptionsHandler]` line, with no session to correlate it with.
+        this.logger.warn(`Status post failed in the engine (${kind})`, {
+          sessionId,
+          error: error instanceof Error ? `${error.name}: ${error.message}` : String(error),
+          ...(error instanceof Error && error.cause instanceof Error ? { cause: error.cause.message } : {}),
+        });
       }
-      throw error;
+      throw clientFacingSsrfError(error);
     }
   }
 
@@ -138,7 +159,7 @@ export class StatusService {
       () => new NotFoundException(`Session ${sessionId} not found or not connected`),
     );
     const gated = await this.gate(sessionId, 'status-text', { text, options });
-    return this.recordedPost(sessionId, () => engine.postTextStatus(gated.text, gated.options));
+    return this.recordedPost(sessionId, 'text', () => engine.postTextStatus(gated.text, gated.options));
   }
 
   async postImageStatus(
@@ -146,22 +167,15 @@ export class StatusService {
     media: { url?: string; base64?: string; mimetype?: string } | undefined,
     options: StatusPostOptions,
   ): Promise<StatusResult> {
-    const base64 = stripBase64DataUri(media?.base64);
-    const url = media?.url;
-    const mimetype = media?.mimetype;
-    if (!url && !base64) {
-      throw new BadRequestException('Either url or base64 must be provided');
-    }
-    assertBase64WithinMediaCap(base64);
+    const payload = resolveMediaBody(media, { fallbackMimetype: 'image/jpeg' });
     const engine = this.engines.require(
       sessionId,
       () => new NotFoundException(`Session ${sessionId} not found or not connected`),
     );
-    const gated = await this.gate(sessionId, 'status-image', {
-      media: { mimetype: mimetype ?? 'image/jpeg', data: base64 || url || '' },
-      options,
-    });
-    return this.recordedPost(sessionId, () => engine.postImageStatus(this.guardGatedMedia(gated.media), gated.options));
+    const gated = await this.gate(sessionId, 'status-image', { media: payload, options });
+    return this.recordedPost(sessionId, 'image', () =>
+      engine.postImageStatus(this.guardGatedMedia(gated.media), gated.options),
+    );
   }
 
   async postVideoStatus(
@@ -169,22 +183,15 @@ export class StatusService {
     media: { url?: string; base64?: string; mimetype?: string } | undefined,
     options: StatusPostOptions,
   ): Promise<StatusResult> {
-    const base64 = stripBase64DataUri(media?.base64);
-    const url = media?.url;
-    const mimetype = media?.mimetype;
-    if (!url && !base64) {
-      throw new BadRequestException('Either url or base64 must be provided');
-    }
-    assertBase64WithinMediaCap(base64);
+    const payload = resolveMediaBody(media, { fallbackMimetype: 'video/mp4' });
     const engine = this.engines.require(
       sessionId,
       () => new NotFoundException(`Session ${sessionId} not found or not connected`),
     );
-    const gated = await this.gate(sessionId, 'status-video', {
-      media: { mimetype: mimetype ?? 'video/mp4', data: base64 || url || '' },
-      options,
-    });
-    return this.recordedPost(sessionId, () => engine.postVideoStatus(this.guardGatedMedia(gated.media), gated.options));
+    const gated = await this.gate(sessionId, 'status-video', { media: payload, options });
+    return this.recordedPost(sessionId, 'video', () =>
+      engine.postVideoStatus(this.guardGatedMedia(gated.media), gated.options),
+    );
   }
 
   /**
@@ -202,22 +209,15 @@ export class StatusService {
     media: { url?: string; base64?: string; mimetype?: string } | undefined,
     options: StatusPostOptions,
   ): Promise<StatusResult> {
-    const base64 = stripBase64DataUri(media?.base64);
-    const url = media?.url;
-    const mimetype = media?.mimetype;
-    if (!url && !base64) {
-      throw new BadRequestException('Either url or base64 must be provided');
-    }
-    assertBase64WithinMediaCap(base64);
+    const payload = resolveMediaBody(media, { fallbackMimetype: 'audio/ogg; codecs=opus' });
     const engine = this.engines.require(
       sessionId,
       () => new NotFoundException(`Session ${sessionId} not found or not connected`),
     );
-    const gated = await this.gate(sessionId, 'status-voice', {
-      media: { mimetype: mimetype ?? 'audio/ogg; codecs=opus', data: base64 || url || '' },
-      options,
-    });
-    return this.recordedPost(sessionId, () => engine.postVoiceStatus(this.guardGatedMedia(gated.media), gated.options));
+    const gated = await this.gate(sessionId, 'status-voice', { media: payload, options });
+    return this.recordedPost(sessionId, 'voice', () =>
+      engine.postVoiceStatus(this.guardGatedMedia(gated.media), gated.options),
+    );
   }
 
   async deleteStatus(sessionId: string, statusId: string): Promise<void> {

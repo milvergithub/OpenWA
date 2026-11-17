@@ -6,13 +6,13 @@ socket. Security matters here, and we appreciate responsible disclosure.
 
 ## Supported versions
 
-Security fixes land on the latest minor release (currently 0.24.x). Older minor
+Security fixes land on the latest minor release (currently 0.30.x). Older minor
 lines receive no backports — please upgrade older deployments.
 
 | Version | Supported          |
 | ------- | ------------------ |
-| 0.24.x  | :white_check_mark: |
-| < 0.24  | :x:                |
+| 0.30.x  | :white_check_mark: |
+| < 0.30  | :x:                |
 
 ## Reporting a vulnerability
 
@@ -50,7 +50,7 @@ the README and `docs/` — in particular `CORS_ORIGINS`, `ALLOW_DEV_API_KEY`,
 Never expose the dashboard/API to the public internet with the development API key
 enabled.
 
-If you created your `.env` by copying `.env.example` before this advisory, check it for
+If you created your `.env` by copying `.env.example` before 0.16.0, check it for
 `ENABLE_SWAGGER=true`. Earlier templates shipped that line uncommented alongside
 `NODE_ENV=production`, so a copied file pinned the opt-in that production otherwise
 withholds, and `/api/docs` is served outside the API-key guard. Comment the line out or
@@ -90,7 +90,7 @@ The application container never mounts `/var/run/docker.sock`; it reaches the da
 only through the bundled `docker-proxy` sidecar (pinned `tecnativa/docker-socket-proxy`),
 which listens solely on an internal Compose network that no other container joins.
 The proxy enables only the endpoint families the built-in datastore orchestration
-needs (`CONTAINERS`, `IMAGES`, `VOLUMES`, `INFO`, `PING`) plus its single `POST`
+needs (`CONTAINERS`, `IMAGES`, `VOLUMES`, `PING`) plus its single `POST`
 method switch.
 
 This is **not** a fine-grained privilege boundary, and we deliberately do not claim

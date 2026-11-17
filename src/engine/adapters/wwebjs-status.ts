@@ -7,10 +7,12 @@ import {
   StatusPostOptions,
   StatusResult,
 } from '../interfaces/whatsapp-engine.interface';
-import { SerializedWid } from '../types/whatsapp-web-js.types';
+import { SerializedWid, readWid } from '../types/whatsapp-web-js.types';
 import { EngineRefusedError } from '../../common/errors/engine-refused.error';
 import { toMessageMedia } from './wwebjs-messaging';
-import { type WwebjsEngineHost, withPage, reportPageDeath } from './wwebjs-host';
+import { isNotice, isUnlistedContentless } from './wwebjs-message-events';
+import { type WwebjsEngineHost, requireClient, withPage, withPageWrite, reportPageDeath } from './wwebjs-host';
+import { noteVideoLoadTimeout } from './wwebjs-video-load-timeout';
 
 /**
  * The status-post counterpart of `toMessageResult`, but its absent-message case is *narrower* than a
@@ -40,7 +42,7 @@ export function toStatusResult(msg: Message | undefined): StatusResult {
   const id = msg.id as unknown as SerializedWid | undefined;
   const ts = msg.timestamp ? new Date(msg.timestamp * 1000) : new Date();
   return {
-    statusId: id?._serialized ?? id?.$1 ?? '',
+    statusId: readWid(id) ?? '',
     timestamp: ts,
     expiresAt: new Date(ts.getTime() + 24 * 3_600_000),
   };
@@ -54,9 +56,9 @@ export function toStatusResult(msg: Message | undefined): StatusResult {
 export class WwebjsStatus {
   constructor(private readonly host: WwebjsEngineHost) {}
 
-  /** Post-ensureReady client handle. */
+  /** Post-ensureReady client handle; see {@link requireClient} for a teardown that lands in between. */
   private client(): Client {
-    return this.host.getClient();
+    return requireClient(this.host);
   }
 
   /** See {@link withPage} for what a dead page answers here. */
@@ -96,13 +98,22 @@ export class WwebjsStatus {
       if (!broadcast?.msgs?.length) {
         continue;
       }
+      const eligible = broadcast.msgs.filter(
+        msg =>
+          msg.type !== MessageTypes.REVOKED &&
+          !isNotice(msg, this.host.logger) &&
+          !isUnlistedContentless(msg, this.host.logger),
+      );
+      if (eligible.length === 0) {
+        continue;
+      }
       const contact = await broadcast.getContact();
       const contactSummary = {
         id: contact.id._serialized,
         ...(contact.name ? { name: contact.name } : {}),
         ...(contact.pushname ? { pushName: contact.pushname } : {}),
       };
-      for (const msg of broadcast.msgs) {
+      for (const msg of eligible) {
         const ts = new Date(msg.timestamp * 1000);
         // Reuse the same capped/limited/timeout-bounded inbound media download the live message path
         // uses (capInboundMediaFor), so a seeded status renders identically to one that arrived live.
@@ -117,7 +128,7 @@ export class WwebjsStatus {
         statuses.push({
           // `deleteStatus` takes this id as its revoke handle, so losing it to the rename makes a
           // listed status unactionable (#747). The contact id above is a Wid and is unaffected.
-          id: ((msg.id as unknown as SerializedWid)?._serialized ?? (msg.id as unknown as SerializedWid)?.$1) || '',
+          id: readWid(msg.id) || '',
           contact: contactSummary,
           type:
             msg.type === MessageTypes.IMAGE
@@ -191,7 +202,10 @@ export class WwebjsStatus {
         ...(options.caption !== undefined ? { caption: options.caption } : {}),
         ...extra,
       }),
-    );
+    ).catch((error: unknown) => {
+      noteVideoLoadTimeout(this.host, error, messageMedia.mimetype);
+      throw error;
+    });
     return toStatusResult(msg);
   }
 
@@ -213,7 +227,7 @@ export class WwebjsStatus {
     // resolves to no message returns silently, which keeps the documented idempotent 200. Caught
     // outside withPage so a dead page still answers 503 first.
     try {
-      await this.withPage('deleteStatus', () => this.client().revokeStatusMessage(statusId));
+      await withPageWrite(this.host, 'deleteStatus', () => this.client().revokeStatusMessage(statusId));
     } catch (error) {
       if (typeof error === 'string' && error.startsWith('Invalid usage!')) {
         throw new EngineRefusedError("Only the account's own statuses can be deleted");

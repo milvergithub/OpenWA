@@ -1,10 +1,10 @@
-import { type Client } from 'whatsapp-web.js';
+import { MessageTypes, type Client } from 'whatsapp-web.js';
 import { Channel, ChannelMessage } from '../interfaces/whatsapp-engine.interface';
-import { BusinessClient, WwjsChannelData } from '../types/whatsapp-web-js.types';
+import { BusinessClient, WwjsChannelData, readWid } from '../types/whatsapp-web-js.types';
 import { EngineNotSupportedError } from '../../common/errors/engine-not-supported.error';
 import { EngineRefusedError } from '../../common/errors/engine-refused.error';
 import { ChannelNotFoundError } from '../../common/errors/channel-not-found.error';
-import { type WwebjsEngineHost, withPage, reportPageDeath } from './wwebjs-host';
+import { type WwebjsEngineHost, withPage, withPageWrite, reportPageDeath } from './wwebjs-host';
 
 /**
  * Channel/Newsletter operations extracted from WhatsAppWebJsAdapter. The adapter keeps the public
@@ -35,7 +35,7 @@ export class WwebjsChannels {
     return channels.map((ch: WwjsChannelData) => ({
       // Read `$1` before giving up (#747: WA Web's minifier renamed the serialized property), and
       // never String() the object branch — that manufactures the literal "undefined" as an id.
-      id: (typeof ch.id === 'object' ? (ch.id._serialized ?? ch.id.$1) : String(ch.id)) || '',
+      id: readWid(ch.id) || '',
       name: String(ch.name || ''),
       description: ch.description ? String(ch.description) : undefined,
       inviteCode: ch.inviteCode ? String(ch.inviteCode) : undefined,
@@ -68,7 +68,7 @@ export class WwebjsChannels {
     // The nid crosses the puppeteer boundary as a raw page-context Wid, exactly the object class
     // WA Web's minifier rename hits (#747): read `$1` before giving up, and never String() an
     // absent id — a channel with the literal id "undefined" is unusable for every follow-up call.
-    const channelId = result.nid._serialized ?? result.nid.$1;
+    const channelId = readWid(result.nid);
     if (!channelId) {
       throw new EngineRefusedError(`Channel '${name}' was created but its id was unreadable — refusing to return it`);
     }
@@ -141,7 +141,7 @@ export class WwebjsChannels {
   /** Delete a channel. `false` means the channel was not found or the server refused. */
   async deleteChannel(channelId: string): Promise<void> {
     this.host.ensureReady();
-    const ok = await this.withPage('deleteChannel', () =>
+    const ok = await withPageWrite(this.host, 'deleteChannel', () =>
       (this.client() as unknown as BusinessClient).deleteChannel(channelId),
     );
     if (!ok) {
@@ -162,7 +162,9 @@ export class WwebjsChannels {
     if (!channelId.endsWith('@newsletter')) {
       throw new ChannelNotFoundError(channelId);
     }
-    const chat = (await this.withPage('muteChannel', () => this.client().getChatById(channelId))) as unknown as {
+    const chat = (await withPageWrite(this.host, 'muteChannel', () =>
+      this.client().getChatById(channelId),
+    )) as unknown as {
       mute?: () => Promise<boolean>;
       unmute?: () => Promise<boolean>;
     } | null;
@@ -170,7 +172,9 @@ export class WwebjsChannels {
     if (!act) {
       throw new ChannelNotFoundError(channelId);
     }
-    const ok = await this.withPage('muteChannel', () => act.call(chat));
+    // The channel acts through its own client, which getClient's readiness check never sees again.
+    this.host.ensureReady();
+    const ok = await withPageWrite(this.host, 'muteChannel', () => act.call(chat));
     if (!ok) {
       throw new EngineRefusedError(`Failed to ${mute ? 'mute' : 'unmute'} channel ${channelId}`);
     }
@@ -200,7 +204,7 @@ export class WwebjsChannels {
     this.host.ensureReady();
     // Resolves false instead of throwing when the unsubscription did not complete (Client.js:2556)
     // — surface the refusal rather than reporting a false success.
-    const ok = await this.withPage('unsubscribeFromChannel', () =>
+    const ok = await withPageWrite(this.host, 'unsubscribeFromChannel', () =>
       (this.client() as unknown as BusinessClient).unsubscribeFromChannel(channelId),
     );
     if (!ok) {
@@ -219,7 +223,7 @@ export class WwebjsChannels {
     const channels = await this.withPage('getChannelMessages', () =>
       (this.client() as unknown as BusinessClient).getChannels(),
     );
-    const channel = channels?.find(c => (typeof c.id === 'object' ? c.id._serialized : c.id) === channelId);
+    const channel = channels?.find(c => readWid(c.id) === channelId);
     if (!channel) {
       throw new ChannelNotFoundError(channelId);
     }
@@ -228,12 +232,18 @@ export class WwebjsChannels {
     // limit fails OPEN and returns every loaded message. Substitute the default instead.
     const safeLimit = Number.isFinite(limit) && limit >= 1 ? Math.trunc(limit) : 50;
     const messages = await this.withPage('getChannelMessages', () => channel.fetchMessages({ limit: safeLimit }));
-    return (messages ?? []).map(msg => ({
+    // WhatsApp Web keeps a deleted update in the list, as a `revoked` entry with no text and no media, and
+    // the response has no field that could say so: a deleted update, and any entry that carries neither
+    // text nor media, is left out.
+    const posts = (messages ?? []).filter(
+      msg => msg.type !== MessageTypes.REVOKED && (Boolean(msg.body) || Boolean(msg.hasMedia)),
+    );
+    return posts.map(msg => ({
       // Read `$1` before the sentinel (#747), and don't `String()` the object branch: that turned an
       // unreadable id into the literal "undefined" rather than the empty sentinel every other path
       // uses. Read-only endpoint — never persisted, never ack-matched — so `''` carries no collision
       // risk here; it just means "id unreadable".
-      id: (typeof msg.id === 'object' ? (msg.id?._serialized ?? msg.id?.$1) : msg.id) || '',
+      id: readWid(msg.id) || '',
       body: String(msg.body || ''),
       timestamp: Number(msg.timestamp),
       hasMedia: Boolean(msg.hasMedia),
